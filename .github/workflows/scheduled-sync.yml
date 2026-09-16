@@ -44,7 +44,7 @@ permissions:
   contents: write   # GITHUB_TOKEN needs this to create releases
 
 env:
-  DEFAULT_SYMBOLS: "nzdusd"   # edit (space-separated) to sync more symbols
+  DEFAULT_SYMBOLS: "jpmususd"   # edit (space-separated) to sync more symbols
 
 jobs:
   daily:
