@@ -6,7 +6,7 @@ on:
       symbol:
         description: "Symbol (e.g. EURUSD)"
         required: true
-        default: "nzdusd"
+        default: "jpmususd"
       year:
         description: "Year (e.g. 2025) — downloads that whole year; leave empty to use start/end dates below"
         required: false
