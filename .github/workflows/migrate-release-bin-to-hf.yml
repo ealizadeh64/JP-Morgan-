@@ -1,0 +1,174 @@
+name: Migrate all annual Releases to Hugging Face
+
+on:
+  workflow_dispatch:
+    inputs:
+      asset_pattern:
+        description: "Annual ZIP asset glob, e.g. XAUUSD_*.zip"
+        required: true
+        default: "XAUUSD_*.zip"
+      symbol:
+        description: "Technical symbol, e.g. XAUUSD"
+        required: true
+        default: "XAUUSD"
+      digits:
+        description: "Digits written to index.txt"
+        required: true
+        default: "5"
+
+permissions:
+  contents: read
+
+env:
+  HF_DATASET: ${{ vars.HF_DATASET || 'Esmaeil9ss/Tickdata' }}
+
+jobs:
+  migrate-oldest-to-newest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependency
+        run: pip install "huggingface_hub>=0.24"
+
+      - name: Build oldest-to-newest release list
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # GitHub returns releases newest-first. Store non-draft releases as
+          # published_at<TAB>tag_name and sort ascending by publication time.
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq '.[] | select(.draft == false and .published_at != null) | [.published_at, .tag_name] | @tsv' \
+            | LC_ALL=C sort > releases-oldest-first.tsv
+
+          if [[ ! -s releases-oldest-first.tsv ]]; then
+            echo "No published releases found in ${GITHUB_REPOSITORY}" >&2
+            exit 1
+          fi
+
+          echo "Release processing order:"
+          cat releases-oldest-first.tsv
+
+      - name: Process all matching ZIP assets sequentially
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SYMBOL: ${{ inputs.symbol }}
+          DIGITS: ${{ inputs.digits }}
+          ASSET_PATTERN: ${{ inputs.asset_pattern }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          processed=0
+          skipped_releases=0
+
+          while IFS=$'\t' read -r published_at release_tag; do
+            [[ -n "$release_tag" ]] || continue
+            echo "============================================================"
+            echo "Release: $release_tag ($published_at)"
+
+            # Read asset names first, then apply the user's shell glob locally.
+            mapfile -t all_assets < <(
+              gh release view "$release_tag" \
+                --repo "$GITHUB_REPOSITORY" \
+                --json assets \
+                --jq '.assets[].name'
+            )
+
+            matching_assets=()
+            for asset_name in "${all_assets[@]}"; do
+              if [[ "$asset_name" == $ASSET_PATTERN ]]; then
+                matching_assets+=("$asset_name")
+              fi
+            done
+
+            if [[ ${#matching_assets[@]} -eq 0 ]]; then
+              echo "No asset matching '$ASSET_PATTERN'; skipping release."
+              skipped_releases=$((skipped_releases + 1))
+              continue
+            fi
+
+            # Deterministic order when one release contains several annual ZIPs.
+            mapfile -t matching_assets < <(printf '%s\n' "${matching_assets[@]}" | LC_ALL=C sort)
+
+            for asset_name in "${matching_assets[@]}"; do
+              echo "------------------------------------------------------------"
+              echo "Asset: $asset_name"
+              rm -rf work
+              mkdir -p work/download work/extracted work/daily-output
+
+              gh release download "$release_tag" \
+                --repo "$GITHUB_REPOSITORY" \
+                --pattern "$asset_name" \
+                --dir work/download \
+                --clobber
+
+              zip_path="work/download/$asset_name"
+              test -f "$zip_path" || { echo "Downloaded ZIP not found: $zip_path" >&2; exit 1; }
+
+              # Validate ZIP members before extraction (prevents ../ path escape).
+              python - "$zip_path" work/extracted <<'PY'
+          import sys, zipfile
+          from pathlib import Path, PurePosixPath
+
+          archive = Path(sys.argv[1])
+          destination = Path(sys.argv[2]).resolve()
+          with zipfile.ZipFile(archive) as zf:
+              for info in zf.infolist():
+                  member = PurePosixPath(info.filename)
+                  if member.is_absolute() or ".." in member.parts:
+                      raise SystemExit(f"unsafe ZIP member: {info.filename}")
+              zf.extractall(destination)
+          PY
+
+              mapfile -d '' bins < <(find work/extracted -type f -iname '*.bin' -print0)
+              if [[ ${#bins[@]} -ne 1 ]]; then
+                echo "Expected exactly one annual BIN in $asset_name; found ${#bins[@]}" >&2
+                printf '  %s\n' "${bins[@]:-}"
+                exit 1
+              fi
+
+              python tools/split_yearly_bin.py \
+                "${bins[0]}" \
+                --symbol "$SYMBOL" \
+                --output work/daily-output
+
+              # One batch/commit per annual ZIP, avoiding one commit per day.
+              python tools/upload_daily_hf.py \
+                work/daily-output \
+                --repo-id "$HF_DATASET" \
+                --symbol "$SYMBOL" \
+                --digits "$DIGITS"
+
+              processed=$((processed + 1))
+              rm -rf work
+            done
+          done < releases-oldest-first.tsv
+
+          echo "============================================================"
+          echo "Migration complete: $processed ZIP asset(s) processed."
+          echo "Releases without matching assets: $skipped_releases"
+          if [[ $processed -eq 0 ]]; then
+            echo "No ZIP assets matched '$ASSET_PATTERN' in any release." >&2
+            exit 1
+          fi
+
+      - name: Upload release order on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: migration-debug-${{ inputs.symbol }}
+          path: |
+            releases-oldest-first.tsv
+          retention-days: 7
+          if-no-files-found: ignore
